@@ -14,6 +14,11 @@ from utils.general import make_divisible, check_file, set_logging
 from utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
     select_device, copy_attr
 
+#* Add lib
+from utils.plots import feature_visualization
+from utils.anchors import make_center_anchors
+from utils.mask import center_to_corner, find_jaccard_overlap, corner_to_center
+
 try:
     import thop  # for FLOPS computation
 except ImportError:
@@ -394,7 +399,9 @@ class Model(nn.Module):
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        # self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        self.model, self.save, self.anchors = parse_model(deepcopy(self.yaml), ch=[ch], get_anchor=True)  # model, savelist
+        self.num_anchors = len(self.anchors)
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         self.inplace = self.yaml.get('inplace', True)
         # logger.info([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
@@ -421,11 +428,19 @@ class Model(nn.Module):
         self.info()
         logger.info('')
 
-    def forward(self, x, augment=False, profile=False):
+    def forward(self, x, augment=False, profile=False, visualize=False, target =None, device=None):
         if augment:
             return self.forward_augment(x)  # augmented inference, None
-        else:
-            return self.forward_once(x, profile)  # single-scale inference, train
+        
+        if target != None:
+            # x_center, y_center, width, height
+            preds, feature = self.forward_once(x, profile, visualize, target)
+            masks = {}
+            for key in target.keys():
+                masks[key]= self._get_imitation_mask(feature, target[key].to(device)).unsqueeze(1)
+            return preds, feature, masks
+        
+        return self.forward_once(x, profile)  # single-scale inference, train
 
     def forward_augment(self, x):
         img_size = x.shape[-2:]  # height, width
@@ -440,8 +455,9 @@ class Model(nn.Module):
             y.append(yi)
         return torch.cat(y, 1), None  # augmented inference, train
 
-    def forward_once(self, x, profile=False):
+    def forward_once(self, x, profile=False, visualize=False, target=None):
         y, dt = [], []  # outputs
+        cnt = 0
         model_outputs = dict()
 
         for m in self.model:
@@ -462,17 +478,110 @@ class Model(nn.Module):
                 logger.info(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
 
             x = m(x)  # run
-            
+
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+
+            if isinstance(m, Concat):
+                cnt += 1
+                if cnt == 2:
+                    feature = x
+
             if not self.export:
                 if self.headlayers.check(m):
-                    model_outputs.update({self.headlayers.get_name(m): x})
-                    
+                    model_outputs.update(
+                        {self.headlayers.get_name(m): x} 
+                    )
+
             y.append(x if m.i in self.save else None)  # save output
 
         if profile:
             logger.info('%.1fms total' % sum(dt))
 
+        if target is not None:
+            return model_outputs, feature
+
         return model_outputs if not self.export else x
+    
+    def _get_imitation_mask(self, x, targets, iou_factor=0.5):
+        """
+        gt_box: (B, K, 4) [x_min, y_min, x_max, y_max]
+        """
+        out_size = x.size(2)
+        batch_size = x.size(0)
+        device = targets.device
+
+        mask_batch = torch.zeros([batch_size, out_size, out_size])
+        
+        if not len(targets):
+            return mask_batch
+        
+        gt_boxes = [[] for i in range(batch_size)]
+        for i in range(len(targets)):
+            #? tách ra xong lại chuyển về gpu
+            gt_boxes[int(targets[i, 0].data)] += [targets[i, 2:6].clone().detach().unsqueeze(0)]
+        
+        max_num = 0
+        for i in range(batch_size):
+            max_num = max(max_num, len(gt_boxes[i]))
+            if len(gt_boxes[i]) == 0:
+                gt_boxes[i] = torch.zeros((1, 4), device=device)
+            else:
+                gt_boxes[i] = torch.cat(gt_boxes[i], 0)
+        
+        for i in range(batch_size):
+            # print(gt_boxes[i].device)
+            if max_num - gt_boxes[i].size(0):
+                gt_boxes[i] = torch.cat((
+                    gt_boxes[i], 
+                    torch.zeros((max_num - gt_boxes[i].size(0), 4), device=device)), 
+                    0
+                )
+            gt_boxes[i] = gt_boxes[i].unsqueeze(0)
+                
+        
+        gt_boxes = torch.cat(gt_boxes, 0)
+        gt_boxes *= out_size
+        
+        center_anchors = make_center_anchors(
+            anchors_wh=self.anchors, 
+            grid_size=out_size, device=device
+        )
+        anchors = center_to_corner(center_anchors).view(-1, 4)  # (N, 4)
+        
+        gt_boxes = center_to_corner(gt_boxes)
+
+        mask_batch = torch.zeros([batch_size, out_size, out_size], device=device)
+
+        for i in range(batch_size):
+            num_obj = gt_boxes[i].size(0)
+            if not num_obj:
+                continue
+             
+            IOU_map = find_jaccard_overlap(anchors, gt_boxes[i], 0).view(
+                out_size, 
+                out_size, 
+                self.num_anchors, 
+                num_obj
+            )
+            max_iou, _ = IOU_map.view(-1, num_obj).max(dim=0)
+            mask_img = torch.zeros(
+                [out_size, out_size], 
+                dtype=torch.int64, 
+                requires_grad=False,
+            ).type_as(x)
+            threshold = max_iou * iou_factor
+
+
+            for k in range(num_obj):
+                mask_per_gt = torch.sum(IOU_map[:, :, :, k] > threshold[k], dim=2).to(device)
+                
+                mask_img += mask_per_gt
+                mask_img += mask_img
+            mask_batch[i] = mask_img
+
+        mask_batch = mask_batch.clamp(0, 1)
+        return mask_batch  # (B, h, w)
 
     def _descale_pred(self, p, flips, scale, img_size):
         # de-scale predictions following augmented inference (inverse operation)
@@ -551,7 +660,7 @@ class Model(nn.Module):
         model_info(self, verbose, img_size)
 
 
-def parse_model(d, ch):  # model_dict, input_channels(3)
+def parse_model(d, ch, get_anchor=False):  # model_dict, input_channels(3)
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     nkpt = d['nkpt'] if 'nkpt' in d.keys() else None
@@ -611,6 +720,12 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         if i == 0:
             ch = []
         ch.append(c2)
+
+    # turn list[list] to list 
+    anchors = sum(anchors, [])
+    anchors = [(anchors[i] // 8, anchors[i + 1] // 8) for i in range(0, len(anchors), 2)]
+    if get_anchor:
+        return nn.Sequential(*layers), sorted(save), anchors
     return nn.Sequential(*layers), sorted(save)
 
 
