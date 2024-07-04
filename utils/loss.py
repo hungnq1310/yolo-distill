@@ -112,6 +112,17 @@ class KPTLoss(nn.Module):
         loss = self.loss_fcn(pred*mask, truel*mask)
         return loss / (torch.sum(mask) + 10e-14)
 
+
+"""Imitaiton loss for distillation"""
+def imitation_loss(teacher, student, mask):
+    if student is None or teacher is None:
+        return 0
+    # print(teacher.shape, student.shape, mask.shape)
+    diff = torch.pow(student - teacher, 2) * mask
+    diff = diff.sum() / mask.sum() / 2
+
+    return diff
+
 class ComputeLoss:
     # Compute losses
     def __init__(self, model, autobalance=False, kpt_label=False, detect_layer=None):
@@ -134,7 +145,7 @@ class ComputeLoss:
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
-        for i in range(1, 5):
+        for i in range(1, 2):
             det = model.module.model[-i] if is_parallel(model) else model.model[-i]  # Detect() module
             if detect_layer == det.__class__.__name__:
                 break
@@ -146,9 +157,9 @@ class ComputeLoss:
             if hasattr(det, k):
                 setattr(self, k, getattr(det, k))
 
-    def __call__(self, p, targets):  # predictions, targets, model
+    def __call__(self, p, targets, teacher=None, student=None, mask=None):  # predictions, targets, model
         device = targets.device
-        lcls, lbox, lobj, lkpt, lkptv = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+        lcls, lbox, lobj, lkpt, lkptv, lmask = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
         tcls, tbox, tkpt, indices, anchors = self.build_targets(p, targets)  # targets
 
         # Losses
@@ -204,8 +215,11 @@ class ComputeLoss:
         lkpt *= self.hyp['kpt']
         bs = tobj.shape[0]  # batch size
 
-        loss = lbox + lobj + lcls + lkpt + lkptv
-        return loss * bs, torch.cat((lbox, lobj, lcls, lkpt, lkptv, loss)).detach()
+        # loss imitation
+        lmask += imitation_loss(teacher, student, mask) * 0.01
+
+        loss = lbox + lobj + lcls + lkpt + lkptv + lmask
+        return loss * bs, torch.cat((lbox, lobj, lcls, lkpt, lkptv, lmask, loss)).detach()
 
     def build_targets(self, p, targets):
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
