@@ -54,8 +54,8 @@ def get_average_tensor(tensor_list):
 
 def train(hyp, opt, device, tb_writer=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
-    save_dir, epochs, batch_size, total_batch_size, weights, rank, kpt_label, freeze, multiloss, detect_layer, warmup = \
-        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.kpt_label, opt.freeze, opt.multilosses, opt.detect_layer, opt.warmup
+    save_dir, epochs, batch_size, total_batch_size, weights, teacher_weights, rank, kpt_label, freeze, multiloss, detect_layer, warmup = \
+        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.teacher_weights, opt.global_rank, opt.kpt_label, opt.freeze, opt.multilosses, opt.detect_layer, opt.warmup
 
     # Directories
     wdir = save_dir / 'weights'
@@ -108,6 +108,15 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('\n\nTransferred %g/%g items from %s\n\n' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), headlayers=headlayers).to(device)  # create
+
+    if teacher_weights:
+        with torch_distributed_zero_first(rank):
+            attempt_download(teacher_weights)  # download if not found locally
+        teacher_ckpt = torch.load(teacher_weights, map_location=device) 
+        #* only load config from teacher checkpoint
+        teacher_model = Model(teacher_ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors'), headlayers=headlayers).to(device)  # create
+        logger.info(f'Load teacher model from {teacher_weights}')  # report
+    
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
@@ -210,11 +219,15 @@ def train(hyp, opt, device, tb_writer=None):
     # DP mode
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
+        if teacher_weights:
+            teacher_model = torch.nn.DataParallel(teacher_model)
 
     # SyncBatchNorm
     if opt.sync_bn and cuda and rank != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         logger.info('Using SyncBatchNorm()')
+        if teacher_weights:
+            teacher_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(teacher_model).to(device)
 
     # Trainloader
     dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
@@ -250,7 +263,11 @@ def train(hyp, opt, device, tb_writer=None):
 
     # DDP mode
     if cuda and rank != -1:
-        model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank,
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    # nn.MultiheadAttention incompatibility with DDP https://github.com/pytorch/pytorch/issues/26698
+                    find_unused_parameters=True)
+        if teacher_weights:
+            teacher_model = DDP(teacher_model, device_ids=[local_rank], output_device=local_rank,
                     # nn.MultiheadAttention incompatibility with DDP https://github.com/pytorch/pytorch/issues/26698
                     find_unused_parameters=any(isinstance(layer, nn.MultiheadAttention) for layer in model.modules()))
 
@@ -265,6 +282,14 @@ def train(hyp, opt, device, tb_writer=None):
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
+    if opt.teacher_weights:
+        teacher_model.nc = nc  # attach number of classes to model
+        teacher_model.hyp = hyp  # attach hyperparameters to model
+        teacher_model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+        teacher_model.names = names
+    
+        for param in teacher_model.parameters():
+            param.requires_grad = False
 
     # Start training
     t0 = time.time()
@@ -276,10 +301,21 @@ def train(hyp, opt, device, tb_writer=None):
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
 
+    if opt.teacher_weights:
+        dump_image = torch.zeros((1, 3, imgsz, imgsz), device=device)
+        targets = {'test': torch.zeros((1, 6+2*kpt_label), device=device)}
+        _, features, _ = model(dump_image, target=targets, device=device)  # forward
+        _, teacher_feature, _ = teacher_model(dump_image, target=targets, device=device) 
+        
+        _, student_channel, student_out_size, _ = features.shape
+        _, teacher_channel, teacher_out_size, _ = teacher_feature.shape
+        
+        stu_feature_adapt = nn.Sequential(nn.Conv2d(student_channel, teacher_channel, 3, padding=1, stride=int(student_out_size / teacher_out_size)), nn.ReLU()).to(device)
+
     # init loss function
     loss_fn = {
-        # 'IKeypoint' : ComputeLoss(model, kpt_label=kpt_label, detect_layer='IKeypoint'),
-        'IDetect' : ComputeLoss(model, detect_layer='IDetect', kpt_label=kpt_label),
+        'IKeypoint' : ComputeLoss(model, kpt_label=kpt_label, detect_layer='IKeypoint'),
+        'IDetectHead' : ComputeLoss(model, detect_layer='IDetectHead', kpt_label=kpt_label),
         # 'IDetectBody' : ComputeLoss(model, detect_layer='IDetectBody')
     }
 
@@ -308,11 +344,11 @@ def train(hyp, opt, device, tb_writer=None):
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(6, device=device)  # mean losses
+        mloss = torch.zeros(7, device=device)  # mean losses
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
-        logger.info(('\n' + '%10s' * 10) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'kpt', 'kptv' ,'total', 'labels', 'img_size'))
+        logger.info(('\n' + '%10s' * 11) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'kpt', 'kptv', 'mask', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
@@ -344,14 +380,31 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Forward
             with amp.autocast(enabled=cuda):
-                model_outputs = model(imgs)  # forward
+                model_outputs, features, _ = model(imgs, target=targets, device=device)  # forward
+                _, teacher_features, masks = teacher_model(imgs, target=targets, device=device)
+                #pred, features, mask = model(imgs, target=targets)  # source origin
+
                 # if don't use multiloss, auto detect last layer and compute_loss
                 if multiloss: # and len(loss_fn.keys()) == len(model_outputs.keys()):
                     _loss, _loss_item = [], []
-                    for name, _loss_fn in loss_fn.items():
-                        _ls, _ls_items = _loss_fn(model_outputs[name], targets[name].to(device))
-                        _loss.append(_ls)
-                        _loss_item.append(_ls_items)
+                    if opt.teacher_weights:
+
+                        for name, _loss_fn in loss_fn.items():
+                            _ls, _ls_items = _loss_fn( 
+                                model_outputs[name], 
+                                targets[name].to(device),
+                                teacher_features.detach(),
+                                stu_feature_adapt(features),
+                                masks[name].detach(),
+                            )
+
+                            _loss.append(_ls)
+                            _loss_item.append(_ls_items)
+                    else:
+                        for name, _loss_fn in loss_fn.items():
+                            _ls, _ls_items = _loss_fn(model_outputs[name], targets[name].to(device))
+                            _loss.append(_ls)
+                            _loss_item.append(_ls_items)
 
                     loss =  _loss[0] if len(_loss) == 1 else sum(_loss) / len(_loss)
                     loss_items = _loss_item[0] if len(_loss_item) == 1 else get_average_tensor(_loss_item)
@@ -381,15 +434,16 @@ def train(hyp, opt, device, tb_writer=None):
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
                 tgt_name = list(targets.keys())
-                s = ('%10s' * 2 + '%10.4g' * 8) % (
-                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets[tgt_name[0]].shape[0], imgs.shape[-1])
+                s = ('%10s' * 2 + '%10.4g' * 9) % (
+                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets[tgt_name[0]].shape[0], imgs.shape[-1]
+                )
                 pbar.set_description(s)
 
                 # Plot
                 if plots and ni < 33:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
                     if isinstance(targets, dict):
-                        if detect_layer == 'IKeypoint':
+                        if detect_layer in ['IKeypoint', 'IKeypointBody']:
                             plot_images(imgs, targets[detect_layer], paths, f, kpt_label=kpt_label)
                         else:
                             plot_images(imgs, targets[detect_layer], paths, f, kpt_label=0)
@@ -429,7 +483,7 @@ def train(hyp, opt, device, tb_writer=None):
                                                  wandb_logger=wandb_logger,
                                                  compute_loss=loss_fn,
                                                  is_coco=is_coco,
-                                                 kpt_label=kpt_label if detect_layer=='IKeypoint' else 0,
+                                                 kpt_label=kpt_label,
                                                  detect_layer=detect_layer)
                 print("Evalutate: ", results)
 
@@ -527,6 +581,7 @@ def train(hyp, opt, device, tb_writer=None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='', help='initial weights path')
+    parser.add_argument('--teacher-weights', type=str, default='', help='initial teacher weights path')
     parser.add_argument('--cfg', type=str, default='cfg/yolov7-tiny-face.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/widerface.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.tiny.yaml', help='hyperparameters path')
@@ -547,7 +602,7 @@ if __name__ == '__main__':
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
-    parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
+    parser.add_argument('--local-rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--workers', type=int, default=8, help='maximum number of dataloader workers')
     parser.add_argument('--project', default='runs/train', help='save to project/name')
     parser.add_argument('--entity', default=None, help='W&B entity')
@@ -571,9 +626,9 @@ if __name__ == '__main__':
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
-    if opt.global_rank in [-1, 0]:
-        check_git_status()
-        check_requirements(exclude=('pycocotools', 'thop'))
+    # if opt.global_rank in [-1, 0]:
+    #     check_git_status()
+        # check_requirements(exclude=('pycocotools', 'thop'))
 
     # Resume
     wandb_run = check_wandb_resume(opt)
