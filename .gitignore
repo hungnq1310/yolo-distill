@@ -167,3 +167,4 @@ runs
 scripts
 datahub
 widerface_evaluate/
+wandb
