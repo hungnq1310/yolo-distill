@@ -116,6 +116,11 @@ def train(hyp, opt, device, tb_writer=None):
         #* only load config from teacher checkpoint
         teacher_model = Model(teacher_ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors'), headlayers=headlayers).to(device)  # create
         logger.info(f'Load teacher model from {teacher_weights}')  # report
+        exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
+        t_state_dict = teacher_ckpt['model'].float().state_dict()  # to FP32
+        t_state_dict = intersect_dicts(t_state_dict, teacher_model.state_dict(), exclude=exclude)  # intersect
+        teacher_model.load_state_dict(t_state_dict, strict=False)  # load
+        logger.info('\n\nTransferred %g/%g items from %s\n\n' % (len(t_state_dict), len(teacher_model.state_dict()), teacher_weights))  # report
     
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
@@ -315,7 +320,7 @@ def train(hyp, opt, device, tb_writer=None):
     # init loss function
     loss_fn = {
         'IKeypoint' : ComputeLoss(model, kpt_label=kpt_label, detect_layer='IKeypoint'),
-        'IDetectHead' : ComputeLoss(model, detect_layer='IDetectHead', kpt_label=kpt_label),
+        'IDetectHead' : ComputeLoss(model, kpt_label=None, detect_layer='IDetectHead'), #* keypoint here is 0
         # 'IDetectBody' : ComputeLoss(model, detect_layer='IDetectBody')
     }
 
@@ -325,6 +330,8 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Starting training for {epochs} epochs...')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+        if opt.teacher_weights: #! eval to faster training
+            teacher_model.eval()
 
         # Update image weights (optional)
         if opt.image_weights:
@@ -381,7 +388,8 @@ def train(hyp, opt, device, tb_writer=None):
             # Forward
             with amp.autocast(enabled=cuda):
                 model_outputs, features, _ = model(imgs, target=targets, device=device)  # forward
-                _, teacher_features, masks = teacher_model(imgs, target=targets, device=device)
+                with torch.no_grad():
+                    _, teacher_features, masks = teacher_model(imgs, target=targets, device=device)
                 #pred, features, mask = model(imgs, target=targets)  # source origin
 
                 # if don't use multiloss, auto detect last layer and compute_loss
@@ -625,7 +633,7 @@ if __name__ == '__main__':
     # Set DDP variables
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
-    local_rank = int(os.environ["LOCAL_RANK"]) or opt.local_rank
+    local_rank = int(os.environ.get("LOCAL_RANK", opt.local_rank))
 
     set_logging(opt.global_rank)
     # if opt.global_rank in [-1, 0]:
