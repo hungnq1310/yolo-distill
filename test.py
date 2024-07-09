@@ -107,7 +107,9 @@ def test(data,
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    loss = torch.zeros(3, device=device)
+
+    #TODO: extend to mask_loss and kpt_loss log
+    loss = torch.zeros(6, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
     #jdict_kpt = [] if kpt_label else None
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
@@ -145,9 +147,9 @@ def test(data,
             
             try:
                 if compute_loss:
-                    loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+                    loss += compute_loss([x.float() for x in train_out], targets)[1][:6] # box, obj, cls, kpt, kptv, mask
             except:
-                loss += compute_loss[detect_layer]([x.float() for x in train_out], targets)[1][:3]
+                loss += compute_loss[detect_layer]([x.float() for x in train_out], targets)[1][:6]
             # Run NMS
             if kpt_label:
                 num_points = (targets.shape[1]//2 - 1)
@@ -394,14 +396,14 @@ if __name__ == '__main__':
     parser.add_argument('--project', default='runs/test', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
-    parser.add_argument('--kpt-label', type=int, default=5, help='number of keypoints')
+    parser.add_argument('--kpt-label', type=int, default=None, help='number of keypoints')
     parser.add_argument('--flip-test', action='store_true', help='Whether to run flip_test or not')
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.save_json_kpt |= opt.data.endswith('coco_kpts.yaml')
     opt.data = check_file(opt.data)  # check file
     print(opt)
-    check_requirements(exclude=('tensorboard', 'pycocotools', 'thop'))
+    # check_requirements(exclude=('tensorboard', 'pycocotools', 'thop'))
 
     if opt.task in ('train', 'val', 'test'):  # run normally
         test(opt.data,
@@ -424,6 +426,7 @@ if __name__ == '__main__':
              dump_img = opt.dump_img,
              kpt_label = opt.kpt_label,
              flip_test = opt.flip_test,
+             detect_layer = opt.detect_layer,
              )
 
     elif opt.task == 'speed':  # speed benchmarks
